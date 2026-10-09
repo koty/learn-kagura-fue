@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Play,
   Pause,
@@ -11,10 +11,7 @@ import {
   BookOpen,
   Music,
   Layers,
-  Volume2,
-  CheckCircle2,
   ArrowRight,
-  ExternalLink,
   Flame,
 } from 'lucide-react';
 import { TrackItem, SectionGroup, PhraseType, PlayMode } from './types';
