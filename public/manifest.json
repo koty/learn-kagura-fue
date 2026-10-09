@@ -1,0 +1,16 @@
+{
+  "title": "神楽曲（サンプル）",
+  "sections": [1, 1, 2, 3, 4, 5, 6, 7, 8, 1, 1, 2, 3, 9, 10],
+  "audioFiles": {
+    "1": "section1.mp3",
+    "2": "section2.mp3",
+    "3": "section3.mp3",
+    "4": "section4.mp3",
+    "5": "section5.mp3",
+    "6": "section6.mp3",
+    "7": "section7.mp3",
+    "8": "section8.mp3",
+    "9": "section9.mp3",
+    "10": "section10.mp3"
+  }
+}
