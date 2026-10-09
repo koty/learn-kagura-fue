@@ -150,9 +150,9 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'zenhan-zenhan',
     majorPart: '前半',
     subPart: '前半',
-    displayName: '前半 - 前半',
+    displayName: '初番',
     description: '基本となる数字フレーズ ① 〜 ⑥',
-    repeatHint: '基本形',
+    repeatHint: '①〜⑥',
     tracks: [
       {
         id: '01',
@@ -232,17 +232,17 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'zenhan-chuhan',
     majorPart: '前半',
     subPart: '中盤',
-    displayName: '前半 - 中盤',
-    description: 'アルファベットフレーズ A 〜 D',
-    repeatHint: '後半で再登場！',
+    displayName: '中盤',
+    description: '中盤フレーズ 中1 〜 中4',
+    repeatHint: '中1〜中4',
     tracks: [
       {
         id: '07',
         order: 7,
         fileName: '07前半-中盤-A.mp3',
-        title: 'フレーズ A',
-        phraseType: 'A',
-        phraseLabel: 'A',
+        title: 'フレーズ 中1',
+        phraseType: 'other',
+        phraseLabel: '中1',
         sectionId: 'zenhan-chuhan',
         subPart: '中盤',
         majorPart: '前半',
@@ -252,9 +252,9 @@ export const SONG_SECTIONS: SectionGroup[] = [
         id: '08',
         order: 8,
         fileName: '08前半-中盤-B.mp3',
-        title: 'フレーズ B',
-        phraseType: 'B',
-        phraseLabel: 'B',
+        title: 'フレーズ 中2',
+        phraseType: 'other',
+        phraseLabel: '中2',
         sectionId: 'zenhan-chuhan',
         subPart: '中盤',
         majorPart: '前半',
@@ -264,9 +264,9 @@ export const SONG_SECTIONS: SectionGroup[] = [
         id: '10',
         order: 9,
         fileName: '10前半-中盤-C.mp3',
-        title: 'フレーズ C',
-        phraseType: 'C',
-        phraseLabel: 'C',
+        title: 'フレーズ 中3',
+        phraseType: 'other',
+        phraseLabel: '中3',
         sectionId: 'zenhan-chuhan',
         subPart: '中盤',
         majorPart: '前半',
@@ -276,9 +276,9 @@ export const SONG_SECTIONS: SectionGroup[] = [
         id: '08d',
         order: 10,
         fileName: '08前半-中盤-D.mp3',
-        title: 'フレーズ D',
-        phraseType: 'D',
-        phraseLabel: 'D',
+        title: 'フレーズ 中4',
+        phraseType: 'other',
+        phraseLabel: '中4',
         sectionId: 'zenhan-chuhan',
         subPart: '中盤',
         majorPart: '前半',
@@ -290,9 +290,9 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'zenhan-kohan',
     majorPart: '前半',
     subPart: '後半',
-    displayName: '前半 - 後半',
+    displayName: '後半',
     description: 'フレーズ ① 〜 ⑤ の繰り返し（⑥は無し）',
-    repeatHint: '前半-前半 ①〜⑤ と同じ',
+    repeatHint: '①〜⑤反復',
     tracks: [
       {
         id: '11',
@@ -360,9 +360,9 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'zenhan-kohan-miya',
     majorPart: '前半',
     subPart: '後半宮',
-    displayName: '前半 - 後半宮',
+    displayName: '宮',
     description: '宮バージョン ① 〜 ⑤',
-    repeatHint: 'フレーズ ①〜⑤ 宮演奏',
+    repeatHint: '①〜⑤宮演奏',
     tracks: [
       {
         id: '16',
@@ -430,7 +430,7 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'zenhan-musubi',
     majorPart: '前半',
     subPart: '後半結び',
-    displayName: '前半 - 結び',
+    displayName: '結び',
     description: '前半の締めくくり',
     tracks: [
       {
@@ -451,7 +451,7 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'kohan-donyu',
     majorPart: '後半',
     subPart: '導入',
-    displayName: '後半 - 導入',
+    displayName: '導入',
     description: '後半への繋ぎ演奏',
     tracks: [
       {
@@ -472,9 +472,9 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'kohan-zenhan',
     majorPart: '後半',
     subPart: '前半',
-    displayName: '後半 - 前半',
+    displayName: '主旋律',
     description: 'A → B → C → D → B (Bを2回反復！)',
-    repeatHint: 'A〜D再登場、Bが2回',
+    repeatHint: 'A B C D B',
     tracks: [
       {
         id: '23',
@@ -542,9 +542,9 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'kohan-zenhan-miya',
     majorPart: '後半',
     subPart: '前半宮',
-    displayName: '後半 - 前半宮',
+    displayName: '宮',
     description: '宮バージョン C → D → B',
-    repeatHint: 'C, D, B 宮演奏',
+    repeatHint: 'C D B 宮演奏',
     tracks: [
       {
         id: '28',
@@ -588,7 +588,7 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'kohan-kohan',
     majorPart: '後半',
     subPart: '後半',
-    displayName: '後半 - 後半（終盤）',
+    displayName: '結び',
     description: '曲のクライマックスと締めくくり',
     tracks: [
       {
@@ -630,3 +630,40 @@ export const PHRASE_GROUPS = ALL_TRACKS.reduce<Record<PhraseType, TrackItem[]>>(
   }
   return acc;
 }, {} as Record<PhraseType, TrackItem[]>);
+
+// 大枠グループ定義（前奏、前半、後半でひとつの項にグルーピング）
+export interface MajorGroup {
+  id: string;
+  majorPart: '前奏' | '前半' | '後半';
+  displayName: string;
+  badgeBg: string;
+  totalTracks: number;
+  sections: SectionGroup[];
+}
+
+export const MAJOR_GROUPS: MajorGroup[] = [
+  {
+    id: 'intro-group',
+    majorPart: '前奏',
+    displayName: '前奏',
+    badgeBg: 'bg-slate-700',
+    totalTracks: SONG_SECTIONS.filter(s => s.majorPart === '前奏').reduce((sum, s) => sum + s.tracks.length, 0),
+    sections: SONG_SECTIONS.filter(s => s.majorPart === '前奏')
+  },
+  {
+    id: 'zenhan-group',
+    majorPart: '前半',
+    displayName: '前半',
+    badgeBg: 'bg-blue-600',
+    totalTracks: SONG_SECTIONS.filter(s => s.majorPart === '前半').reduce((sum, s) => sum + s.tracks.length, 0),
+    sections: SONG_SECTIONS.filter(s => s.majorPart === '前半')
+  },
+  {
+    id: 'kohan-group',
+    majorPart: '後半',
+    displayName: '後半',
+    badgeBg: 'bg-rose-700',
+    totalTracks: SONG_SECTIONS.filter(s => s.majorPart === '後半').reduce((sum, s) => sum + s.tracks.length, 0),
+    sections: SONG_SECTIONS.filter(s => s.majorPart === '後半')
+  }
+];

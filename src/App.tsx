@@ -8,19 +8,114 @@ import {
   Repeat1,
   RotateCcw,
   Sparkles,
-  BookOpen,
   Music,
-  Layers,
-  ArrowRight,
   Flame,
 } from 'lucide-react';
 import { TrackItem, SectionGroup, PhraseType, PlayMode } from './types';
 import {
-  SONG_SECTIONS,
   ALL_TRACKS,
   PHRASE_COLORS,
   PHRASE_GROUPS,
+  MAJOR_GROUPS,
+  MajorGroup,
 } from './songData';
+
+// --- Web Audio API エンジン ---
+let audioCtx: AudioContext | null = null;
+
+function unlockAudioContext(): AudioContext {
+  if (!audioCtx) {
+    const AudioCtxClass =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    audioCtx = new AudioCtxClass();
+    (window as any).__audioCtx = audioCtx;
+  }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+  return audioCtx;
+}
+
+function getAudioContext(): AudioContext {
+  return unlockAudioContext();
+}
+
+// デコード済みバッファのキャッシュ（生音源 & デクリック処理済み音源）
+const rawBufferCache = new Map<string, AudioBuffer>();
+const declickedBufferCache = new Map<string, AudioBuffer>();
+
+/**
+ * 音声バッファを取得し、デクリック（先頭/末尾のマイクロフェード）を適用する
+ */
+async function loadAudioBuffer(fileName: string, declick: boolean): Promise<AudioBuffer> {
+  const ctx = getAudioContext();
+  const url = `/audio/${encodeURIComponent(fileName)}`;
+  console.log('>>> [loadAudioBuffer START]', url);
+
+  let raw = rawBufferCache.get(url);
+  if (!raw) {
+    console.log('>>> [loadAudioBuffer] fetching:', url);
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.error('>>> [loadAudioBuffer] fetch failed! status:', res.status, url);
+      throw new Error(`Fetch failed with status ${res.status}`);
+    }
+    const arrayBuffer = await res.arrayBuffer();
+    console.log('>>> [loadAudioBuffer] decoding audio data for:', url, 'bytes:', arrayBuffer.byteLength);
+    raw = await ctx.decodeAudioData(arrayBuffer);
+    console.log('>>> [loadAudioBuffer] decode success! duration:', raw.duration);
+    rawBufferCache.set(url, raw);
+  }
+
+  if (!declick) return raw;
+
+  let declicked = declickedBufferCache.get(url);
+  if (!declicked) {
+    declicked = ctx.createBuffer(raw.numberOfChannels, raw.length, raw.sampleRate);
+    const fadeSamplesIn = Math.min(Math.floor(raw.sampleRate * 0.025), raw.length);
+    const fadeSamplesOut = Math.min(Math.floor(raw.sampleRate * 0.04), raw.length);
+
+    for (let ch = 0; ch < raw.numberOfChannels; ch++) {
+      const srcData = raw.getChannelData(ch);
+      const dstData = declicked.getChannelData(ch);
+      dstData.set(srcData);
+
+      // 1. 演奏内部の2秒周期バッファ段差（プツプツ音の本体）を検出してコサイン補間
+      for (let i = 2; i < dstData.length - 10; i++) {
+        const d2 = dstData[i] - 2 * dstData[i - 1] + dstData[i - 2];
+        // 笛の音にはない急激なステップ段差 (|d2| > 0.09) を検出
+        if (Math.abs(d2) > 0.09) {
+          const left = i - 2;
+          const right = i + 6;
+          const valL = dstData[left];
+          const valR = dstData[right];
+          for (let idx = left; idx <= right; idx++) {
+            const prog = (idx - left) / (right - left);
+            const factor = 0.5 * (1 - Math.cos(Math.PI * prog));
+            dstData[idx] = valL + (valR - valL) * factor;
+          }
+          i = right; // 補間区間をスキップ
+        }
+      }
+
+      // 2. 先頭フェードイン（0 -> 1）
+      for (let i = 0; i < fadeSamplesIn; i++) {
+        const factor = 0.5 * (1 - Math.cos((Math.PI * i) / fadeSamplesIn));
+        dstData[i] *= factor;
+      }
+      // 3. 末尾フェードアウト（1 -> 0）
+      const len = raw.length;
+      for (let i = 0; i < fadeSamplesOut; i++) {
+        const factor = 0.5 * (1 + Math.cos((Math.PI * i) / fadeSamplesOut));
+        dstData[len - fadeSamplesOut + i] *= factor;
+      }
+    }
+    declickedBufferCache.set(url, declicked);
+  }
+
+  return declicked;
+}
 
 export default function App() {
   // 再生状態
@@ -31,10 +126,18 @@ export default function App() {
   const [playbackRate, setPlaybackRate] = useState<number>(1.0);
   const [playMode, setPlayMode] = useState<PlayMode>('continuous'); // continuous | section-loop | single
   const [hoveredPhraseType, setHoveredPhraseType] = useState<PhraseType | null>(null);
-  const [activeTab, setActiveTab] = useState<'all' | 'structure' | 'compare'>('all');
-  const [selectedPhraseForCompare, setSelectedPhraseForCompare] = useState<PhraseType>('1');
 
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // プチ音軽減 (De-click) モード（改善時まで一旦OFF）
+  const isDeclickEnabled = false;
+
+  // Web Audio 再生制御用のRef
+  const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const activeGainRef = useRef<GainNode | null>(null);
+  const activeFilterRef = useRef<BiquadFilterNode | null>(null);
+  const startTimeRef = useRef<number>(0);
+  const pausedAtRef = useRef<number>(0);
+  const rafIdRef = useRef<number | null>(null);
+  const isManuallyStoppingRef = useRef<boolean>(false);
 
   // 現在再生中のトラック
   const currentTrack: TrackItem | null = useMemo(() => {
@@ -48,124 +151,235 @@ export default function App() {
     return PHRASE_GROUPS[currentTrack.phraseType] || [];
   }, [currentTrack]);
 
-  // 音声の停止
-  const stopAudio = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.currentTime = 0;
-    }
-    setIsPlaying(false);
-    setCurrentTime(0);
+  // 初回タップ時の Web Audio アンロック（iOS Safari / Chrome Autoplay Policy 対策）
+  useEffect(() => {
+    const unlock = () => {
+      unlockAudioContext();
+    };
+    window.addEventListener('pointerdown', unlock, { passive: true });
+    window.addEventListener('touchstart', unlock, { passive: true });
+    window.addEventListener('click', unlock, { passive: true });
+    window.addEventListener('keydown', unlock, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('touchstart', unlock);
+      window.removeEventListener('click', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
   }, []);
+
+  // 進行状況の定期更新
+  const stopProgressLoop = useCallback(() => {
+    if (rafIdRef.current) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+  }, []);
+
+  const startProgressLoop = useCallback((trackDuration: number) => {
+    stopProgressLoop();
+    const update = () => {
+      if (!audioCtx) return;
+      const elapsed = (audioCtx.currentTime - startTimeRef.current) * playbackRate + pausedAtRef.current;
+      setCurrentTime(Math.min(elapsed, trackDuration));
+      if (elapsed < trackDuration) {
+        rafIdRef.current = requestAnimationFrame(update);
+      }
+    };
+    rafIdRef.current = requestAnimationFrame(update);
+  }, [playbackRate, stopProgressLoop]);
+
+  // 音声の停止（マイクロフェードアウトでクリックを完全に防ぐ）
+  const stopAudio = useCallback((instant = false) => {
+    isManuallyStoppingRef.current = true;
+    stopProgressLoop();
+
+    const ctx = audioCtx;
+    const gain = activeGainRef.current;
+    const source = activeSourceRef.current;
+
+    // 手動停止時は onended リスナーを即座に破棄（次のトラックへの誤進行を完全防止）
+    if (source) {
+      source.onended = null;
+    }
+
+    if (gain && ctx && !instant) {
+      // 20ms かけてボリュームを滑らかに 0 に落とす
+      try {
+        gain.gain.setValueAtTime(gain.gain.value, ctx.currentTime);
+        gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.02);
+      } catch {
+        // ignore
+      }
+      setTimeout(() => {
+        try {
+          source?.stop();
+        } catch {
+          // ignore
+        }
+      }, 25);
+    } else {
+      try {
+        source?.stop();
+      } catch {
+        // ignore
+      }
+    }
+
+    activeSourceRef.current = null;
+    activeGainRef.current = null;
+    activeFilterRef.current = null;
+    setIsPlaying(false);
+  }, [stopProgressLoop]);
 
   // トラック再生
   const playTrack = useCallback(
-    (index: number) => {
-      if (index < 0 || index >= ALL_TRACKS.length) return;
+    async (index: number, startOffset = 0) => {
+      if (index < 0 || index >= ALL_TRACKS.length) {
+        console.warn('Index out of bounds:', index);
+        return;
+      }
 
       const track = ALL_TRACKS[index];
-      stopAudio();
+      stopAudio(false);
 
-      const audio = new Audio(`/audio/${encodeURIComponent(track.fileName)}`);
-      audio.playbackRate = playbackRate;
-      audioRef.current = audio;
+      const ctx = unlockAudioContext();
+      if (ctx.state === 'suspended') {
+        try {
+          await Promise.race([
+            ctx.resume(),
+            new Promise(resolve => setTimeout(resolve, 150))
+          ]);
+        } catch {
+          // ignore
+        }
+      }
 
-      audio.ontimeupdate = () => {
-        setCurrentTime(audio.currentTime);
-      };
+      try {
+        const buffer = await loadAudioBuffer(track.fileName, isDeclickEnabled);
 
-      audio.onloadedmetadata = () => {
-        setDuration(audio.duration);
-      };
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.playbackRate.value = playbackRate;
 
-      audio.onended = () => {
-        setIsPlaying(false);
+        // ハイパスフィルター（80Hz以下をカットし、息の吹かれ音や低域ポップノイズを除去）
+        const filter = ctx.createBiquadFilter();
+        filter.type = 'highpass';
+        filter.frequency.value = isDeclickEnabled ? 85 : 10;
 
-        if (playMode === 'continuous') {
-          // 通し再生：次のトラックへ
-          if (index + 1 < ALL_TRACKS.length) {
-            playTrack(index + 1);
+        // ゲインノード
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(1, ctx.currentTime);
+
+        source.connect(filter);
+        filter.connect(gain);
+        gain.connect(ctx.destination);
+
+        activeSourceRef.current = source;
+        activeGainRef.current = gain;
+        activeFilterRef.current = filter;
+
+        const effectiveDuration = buffer.duration;
+        setDuration(effectiveDuration);
+        pausedAtRef.current = startOffset;
+        startTimeRef.current = ctx.currentTime;
+        isManuallyStoppingRef.current = false;
+
+        setCurrentTrackIndex(index);
+        setIsPlaying(true);
+
+        source.start(0, startOffset);
+        startProgressLoop(effectiveDuration);
+
+        source.onended = () => {
+          if (activeSourceRef.current !== source || isManuallyStoppingRef.current) return;
+          stopProgressLoop();
+          setIsPlaying(false);
+          pausedAtRef.current = 0;
+          setCurrentTime(0);
+
+          // 再生モードに応じた次トラック処理
+          if (playMode === 'continuous') {
+            if (index + 1 < ALL_TRACKS.length) {
+              playTrack(index + 1);
+            } else {
+              setCurrentTrackIndex(null);
+            }
+          } else if (playMode === 'section-loop') {
+            const currentSectionId = track.sectionId;
+            const sectionTracks = ALL_TRACKS.filter(t => t.sectionId === currentSectionId);
+            const currentIndexInSection = sectionTracks.findIndex(t => t.id === track.id);
+
+            if (currentIndexInSection + 1 < sectionTracks.length) {
+              const nextTrack = sectionTracks[currentIndexInSection + 1];
+              const nextGlobalIndex = ALL_TRACKS.findIndex(t => t.id === nextTrack.id);
+              playTrack(nextGlobalIndex);
+            } else {
+              const firstTrack = sectionTracks[0];
+              const firstGlobalIndex = ALL_TRACKS.findIndex(t => t.id === firstTrack.id);
+              playTrack(firstGlobalIndex);
+            }
           } else {
             setCurrentTrackIndex(null);
           }
-        } else if (playMode === 'section-loop') {
-          // セクション内ループ
-          const currentSectionId = track.sectionId;
-          const sectionTracks = ALL_TRACKS.filter(t => t.sectionId === currentSectionId);
-          const currentIndexInSection = sectionTracks.findIndex(t => t.id === track.id);
-
-          if (currentIndexInSection + 1 < sectionTracks.length) {
-            const nextTrack = sectionTracks[currentIndexInSection + 1];
-            const nextGlobalIndex = ALL_TRACKS.findIndex(t => t.id === nextTrack.id);
-            playTrack(nextGlobalIndex);
-          } else {
-            const firstTrack = sectionTracks[0];
-            const firstGlobalIndex = ALL_TRACKS.findIndex(t => t.id === firstTrack.id);
-            playTrack(firstGlobalIndex);
-          }
-        } else {
-          // 単発再生
-          setCurrentTrackIndex(null);
-        }
-      };
-
-      audio
-        .play()
-        .then(() => {
-          setCurrentTrackIndex(index);
-          setIsPlaying(true);
-        })
-        .catch(err => {
-          console.error('Playback error:', err);
-          setIsPlaying(false);
-        });
+        };
+      } catch (err) {
+        console.error('Audio playback error:', err);
+        setIsPlaying(false);
+      }
     },
-    [playbackRate, playMode, stopAudio]
+    [isDeclickEnabled, playbackRate, playMode, stopAudio, startProgressLoop, stopProgressLoop]
   );
 
-  // 再生 / 一時停止
+  // 再生 / 一時停止切り替え
   const togglePlayPause = useCallback(() => {
-    if (!audioRef.current || currentTrackIndex === null) {
+    unlockAudioContext();
+    if (currentTrackIndex === null) {
       playTrack(0);
       return;
     }
 
     if (isPlaying) {
-      audioRef.current.pause();
-      setIsPlaying(false);
+      // 一時停止
+      if (audioCtx) {
+        const elapsed = (audioCtx.currentTime - startTimeRef.current) * playbackRate + pausedAtRef.current;
+        pausedAtRef.current = elapsed;
+      }
+      stopAudio(false);
     } else {
-      audioRef.current
-        .play()
-        .then(() => setIsPlaying(true))
-        .catch(err => console.error(err));
+      // 再開
+      playTrack(currentTrackIndex, pausedAtRef.current);
     }
-  }, [isPlaying, currentTrackIndex, playTrack]);
+  }, [currentTrackIndex, isPlaying, playTrack, playbackRate, stopAudio]);
 
   // 前へ
   const handlePrev = useCallback(() => {
+    unlockAudioContext();
     if (currentTrackIndex === null) return;
     if (currentTime > 2) {
-      if (audioRef.current) audioRef.current.currentTime = 0;
+      playTrack(currentTrackIndex, 0);
       return;
     }
     const prevIndex = Math.max(0, currentTrackIndex - 1);
-    playTrack(prevIndex);
+    playTrack(prevIndex, 0);
   }, [currentTrackIndex, currentTime, playTrack]);
 
   // 次へ
   const handleNext = useCallback(() => {
+    unlockAudioContext();
     if (currentTrackIndex === null) return;
     const nextIndex = Math.min(ALL_TRACKS.length - 1, currentTrackIndex + 1);
-    playTrack(nextIndex);
+    playTrack(nextIndex, 0);
   }, [currentTrackIndex, playTrack]);
 
-  // 再生速度
+  // 再生速度の変更
   const handleSpeedChange = (speed: number) => {
     setPlaybackRate(speed);
-    if (audioRef.current) {
-      audioRef.current.playbackRate = speed;
+    if (activeSourceRef.current) {
+      activeSourceRef.current.playbackRate.value = speed;
     }
   };
+
 
   // キーボードショートカット
   useEffect(() => {
@@ -204,118 +418,70 @@ export default function App() {
 
       {/* --- ヘッダー --- */}
       <header className="sticky top-0 z-40 backdrop-blur-xl bg-slate-950/80 border-b border-slate-800/80 shadow-lg shadow-black/40">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-col sm:flex-row items-center justify-between gap-3">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2.5 flex items-center justify-between gap-3">
           {/* タイトル & ロゴ */}
-          <div className="flex items-center gap-3 w-full sm:w-auto">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-rose-600 to-red-800 text-white font-bold flex items-center justify-center shadow-lg shadow-rose-900/40 border border-rose-500/30 text-lg tracking-wider">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-rose-600 to-red-800 text-white font-bold flex items-center justify-center shadow-lg shadow-rose-900/40 border border-rose-500/30 text-base tracking-wider">
               笛
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-lg sm:text-xl font-bold tracking-tight text-white font-serif flex items-center gap-1.5">
+                <h1 className="text-base sm:text-lg font-bold tracking-tight text-white font-serif flex items-center gap-1.5">
                   神楽笛 旋律・リピート暗記帖
                 </h1>
                 <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
                   全33節
                 </span>
               </div>
-              <p className="text-xs text-slate-400">楽譜のないお祭りの笛曲を、反復構造の可視化で覚える学習ナビ</p>
+              <p className="text-[11px] text-slate-400">楽譜のないお祭りの笛曲を、反復構造の可視化で覚える学習ナビ</p>
             </div>
           </div>
-
-          {/* ナビゲーションタブ */}
-          <nav className="flex items-center bg-slate-900/90 p-1 rounded-xl border border-slate-800 w-full sm:w-auto overflow-x-auto">
-            <button
-              onClick={() => setActiveTab('all')}
-              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all whitespace-nowrap ${
-                activeTab === 'all'
-                  ? 'bg-rose-600 text-white shadow-md shadow-rose-950'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-              }`}
-            >
-              <Layers className="w-3.5 h-3.5" />
-              曲の全景マップ
-            </button>
-            <button
-              onClick={() => setActiveTab('structure')}
-              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all whitespace-nowrap ${
-                activeTab === 'structure'
-                  ? 'bg-rose-600 text-white shadow-md shadow-rose-950'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-              }`}
-            >
-              <BookOpen className="w-3.5 h-3.5" />
-              暗記の秘訣（要約）
-            </button>
-            <button
-              onClick={() => setActiveTab('compare')}
-              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all whitespace-nowrap ${
-                activeTab === 'compare'
-                  ? 'bg-rose-600 text-white shadow-md shadow-rose-950'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-              }`}
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              同フレーズ聴き比べ
-            </button>
-          </nav>
         </div>
       </header>
 
       {/* --- メインコンテンツ --- */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6 w-full relative z-10 flex-1">
+      <main className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 pt-3 w-full relative z-10 flex-1">
         {/* --- 現在再生中の同調案内バナー --- */}
         {currentTrack && (
-          <div className="mb-6 rounded-2xl bg-gradient-to-r from-slate-900/95 via-slate-900/90 to-slate-900/95 border border-slate-700/80 p-4 sm:p-5 shadow-2xl relative overflow-hidden backdrop-blur-md">
+          <div className="mb-3 rounded-xl bg-gradient-to-r from-slate-900/95 via-slate-900/90 to-slate-900/95 border border-slate-700/80 p-3 shadow-xl relative overflow-hidden backdrop-blur-md">
             {/* アンビエント発光背景 */}
             <div
-              className="absolute -right-20 -top-20 w-64 h-64 rounded-full blur-3xl opacity-30 pointer-events-none"
+              className="absolute -right-20 -top-20 w-48 h-48 rounded-full blur-3xl opacity-25 pointer-events-none"
               style={{ backgroundColor: PHRASE_COLORS[currentTrack.phraseType].main }}
             />
 
-            <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 relative z-10">
+            <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3 relative z-10">
               {/* 再生中タイトルとバッジ */}
-              <div className="flex items-center gap-4">
+              <div className="flex items-center gap-3">
                 <div
-                  className={`w-14 h-14 rounded-2xl ${PHRASE_COLORS[currentTrack.phraseType].badgeBg} text-white font-extrabold text-2xl flex items-center justify-center shadow-lg border border-white/20 shrink-0 transform transition-transform animate-pulse`}
+                  className={`w-11 h-11 rounded-xl ${PHRASE_COLORS[currentTrack.phraseType].badgeBg} text-white font-black text-xl flex items-center justify-center shadow-md border border-white/20 shrink-0 transform transition-transform animate-pulse`}
                   style={{
-                    boxShadow: `0 0 20px ${PHRASE_COLORS[currentTrack.phraseType].glow}`,
+                    boxShadow: `0 0 15px ${PHRASE_COLORS[currentTrack.phraseType].glow}`,
                   }}
                 >
                   {currentTrack.phraseLabel}
                 </div>
                 <div>
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="text-[11px] font-bold uppercase tracking-wider text-rose-400 flex items-center gap-1">
-                      <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping inline-block" />
-                      NOW PLAYING
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-rose-400 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-ping inline-block" />
+                      PLAYING
                     </span>
-                    <span className="text-xs text-slate-400 font-medium">
-                      [{currentTrack.majorPart} - {currentTrack.subPart}]
+                    <span className="text-xs text-slate-300 font-bold">
+                      {currentTrack.majorPart} - {currentTrack.subPart} ({currentTrack.phraseLabel})
                     </span>
                   </div>
-                  <h2 className="text-lg sm:text-xl font-bold text-white flex items-center gap-2">
-                    {currentTrack.title}
-                    <span className="text-xs font-normal text-slate-400">
-                      (通し #{currentTrack.order})
-                    </span>
-                  </h2>
                 </div>
               </div>
 
               {/* 同フレーズ登場箇所のクイックリンク */}
               {currentTrack.phraseType !== 'other' && matchingTracks.length > 1 && (
-                <div className="w-full md:w-auto bg-slate-950/70 p-3 rounded-xl border border-slate-800/80 backdrop-blur-sm">
-                  <div className="text-[11px] font-semibold text-slate-400 mb-2 flex items-center gap-1.5">
-                    <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                    <span>
-                      同じフレーズ「{currentTrack.phraseType}」（{PHRASE_COLORS[currentTrack.phraseType].name}）の全登場箇所:
-                    </span>
-                    <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-bold">
-                      全{matchingTracks.length}回
-                    </span>
+                <div className="w-full md:w-auto bg-slate-950/70 px-2.5 py-1.5 rounded-lg border border-slate-800/80 backdrop-blur-sm flex items-center gap-2 flex-wrap">
+                  <div className="text-[11px] font-semibold text-slate-400 flex items-center gap-1 shrink-0">
+                    <Sparkles className="w-3 h-3 text-amber-400" />
+                    <span>同じ「{currentTrack.phraseType}」:</span>
                   </div>
-                  <div className="flex flex-wrap gap-1.5">
+                  <div className="flex flex-wrap gap-1">
                     {matchingTracks.map(t => {
                       const isSelf = t.id === currentTrack.id;
                       const globalIdx = ALL_TRACKS.findIndex(item => item.id === t.id);
@@ -323,15 +489,14 @@ export default function App() {
                         <button
                           key={t.id}
                           onClick={() => playTrack(globalIdx)}
-                          className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 ${
+                          className={`px-2 py-0.5 rounded text-[11px] font-medium transition-all flex items-center gap-1 ${
                             isSelf
-                              ? `${PHRASE_COLORS[t.phraseType].badgeBg} text-white font-bold shadow-md ring-2 ring-white/30`
-                              : 'bg-slate-800/90 hover:bg-slate-700 text-slate-300 border border-slate-700'
+                              ? `${PHRASE_COLORS[t.phraseType].badgeBg} text-white font-bold shadow-sm ring-1 ring-white/40`
+                              : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700'
                           }`}
                         >
                           <span>{t.subPart}</span>
                           <span className="text-[10px] opacity-80">({t.phraseLabel})</span>
-                          {isSelf && <span className="text-[9px] bg-black/30 px-1 rounded">演奏中</span>}
                         </button>
                       );
                     })}
@@ -342,418 +507,188 @@ export default function App() {
           </div>
         )}
 
-        {/* --- フレーズ色分け凡例バー --- */}
-        <div className="mb-6 p-3.5 rounded-2xl bg-slate-900/60 border border-slate-800/80 backdrop-blur-md flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
-          <div className="flex items-center gap-2 text-xs text-slate-400 font-medium">
-            <span className="w-2 h-2 rounded-full bg-rose-500" />
-            <span className="font-bold text-slate-200">フレーズ色分け凡例:</span>
-            <span className="hidden sm:inline">同じ色の節は同じメロディです（タップでハイライト）</span>
+        {/* 曲全体の通しタイムライン（パノラマ・ミニマップ） */}
+        <div className="mb-2 p-2 sm:p-2.5 rounded-xl bg-slate-900/80 border border-slate-800 shadow-md">
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <Flame className="w-3.5 h-3.5 text-amber-400" />
+              <span className="text-[11px] font-bold text-slate-300">通し進行バー（全33節）</span>
+            </div>
+            <span className="text-[10px] text-slate-400">タップで再生</span>
           </div>
 
-          <div className="flex flex-wrap gap-1.5 w-full md:w-auto">
-            {(['1', '2', '3', '4', '5', '6', 'A', 'B', 'C', 'D'] as PhraseType[]).map(type => {
-              const count = PHRASE_GROUPS[type]?.length || 0;
-              const isSelected = hoveredPhraseType === type;
-              const color = PHRASE_COLORS[type];
+          {/* 33個のブロックバー */}
+          <div className="flex gap-1 h-8 bg-slate-950 p-1 rounded-xl border border-slate-800/80 overflow-x-auto items-center">
+            {ALL_TRACKS.map((t, idx) => {
+              const isCurrent = currentTrackIndex === idx;
+              const isSamePhrase =
+                !isCurrent &&
+                currentTrack &&
+                currentTrack.phraseType !== 'other' &&
+                currentTrack.phraseType === t.phraseType;
+              const color = PHRASE_COLORS[t.phraseType];
+              const minimapLabel =
+                t.phraseType !== 'other'
+                  ? t.phraseType
+                  : t.phraseLabel === '前奏'
+                  ? '前'
+                  : t.phraseLabel.startsWith('結')
+                  ? '結'
+                  : t.phraseLabel === '導入'
+                  ? '導'
+                  : t.phraseLabel;
+              const isMultiChar = minimapLabel.length > 1;
 
               return (
                 <button
-                  key={type}
-                  onClick={() => setHoveredPhraseType(prev => (prev === type ? null : type))}
-                  onMouseEnter={() => setHoveredPhraseType(type)}
-                  onMouseLeave={() => setHoveredPhraseType(null)}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-all border flex items-center gap-1.5 ${
-                    isSelected
-                      ? `${color.badgeBg} text-white shadow-lg shadow-black/50 border-white/40 scale-105`
-                      : `${color.pillBg} hover:brightness-125`
+                  key={t.id}
+                  onClick={() => {
+                    unlockAudioContext();
+                    playTrack(idx);
+                  }}
+                  title={`#${t.order} ${t.title} (${t.subPart})`}
+                  className={`h-full ${
+                    isMultiChar ? 'min-w-[22px] text-[9px] px-0.5' : 'min-w-[17px] text-[10px]'
+                  } flex-1 rounded-md font-bold flex items-center justify-center transition-all relative group ${
+                    isCurrent
+                      ? 'bg-slate-950 text-white border-2 scale-110 z-10 font-black'
+                      : isSamePhrase
+                      ? `${color.badgeBg} text-white ring-2 ring-white/60 animate-pulse`
+                      : `${color.badgeBg} text-white/90 opacity-60 hover:opacity-100 hover:scale-105`
                   }`}
+                  style={{
+                    borderColor: isCurrent ? color.main : undefined,
+                    boxShadow: isCurrent ? `0 0 12px ${color.glow}` : undefined,
+                  }}
                 >
-                  <span className="w-2 h-2 rounded-full bg-current opacity-80" />
-                  <span>{type}</span>
-                  <span className="text-[10px] opacity-75">({count})</span>
+                  {minimapLabel}
+                  {/* ホバーツールチップ */}
+                  <span className="absolute -top-8 left-1/2 -translate-x-1/2 px-2 py-0.5 bg-slate-800 text-[10px] text-white rounded whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity border border-slate-700 shadow-lg z-20">
+                    #{t.order} {t.title}
+                  </span>
                 </button>
               );
             })}
           </div>
         </div>
 
-        {/* ============================================================== */}
-        {/* TAB 1: 曲の全景マップ */}
-        {/* ============================================================== */}
-        {activeTab === 'all' && (
-          <div className="space-y-8">
-            {/* 曲全体の通しタイムライン（パノラマ・ミニマップ） */}
-            <div className="p-4 rounded-2xl bg-slate-900/80 border border-slate-800 shadow-xl">
-              <div className="flex items-center justify-between mb-2">
+        {/* 大項目グルーピング（前奏・前半・後半の3項目で構成） */}
+        <div className="space-y-2 sm:space-y-2.5">
+          {MAJOR_GROUPS.map((group: MajorGroup) => (
+            <div
+              key={group.id}
+              className="rounded-2xl bg-slate-900/80 border border-slate-800/90 p-2 sm:p-2.5 shadow-md backdrop-blur-sm hover:border-slate-700/80 transition-colors"
+            >
+              {/* 大項目ヘッダー（項のタイトル） */}
+              <div className="flex items-center justify-between mb-1.5 px-1 pb-1 border-b border-slate-800/60">
                 <div className="flex items-center gap-2">
-                  <Flame className="w-4 h-4 text-amber-400" />
-                  <span className="text-xs font-bold text-slate-300">曲全体の通し進行バー（全33節）</span>
+                  <span
+                    className={`text-[10px] font-black px-2 py-0.5 rounded text-white shadow-sm ${group.badgeBg}`}
+                  >
+                    {group.displayName}
+                  </span>
+                  <span className="text-[11px] font-bold text-slate-400">
+                    全{group.totalTracks}節
+                  </span>
                 </div>
-                <span className="text-[11px] text-slate-400">タップした位置から再生</span>
+                {group.majorPart === '前半' && (
+                  <span className="text-[10px] text-slate-400 font-medium hidden sm:inline">
+                    初番 ➔ 中盤 ➔ 後半 ➔ 宮 ➔ 結び
+                  </span>
+                )}
+                {group.majorPart === '後半' && (
+                  <span className="text-[10px] text-slate-400 font-medium hidden sm:inline">
+                    導入 ➔ 主旋律 ➔ 宮 ➔ 結び
+                  </span>
+                )}
               </div>
 
-              {/* 33個のブロックバー */}
-              <div className="flex gap-1 h-9 bg-slate-950 p-1 rounded-xl border border-slate-800/80 overflow-x-auto items-center">
-                {ALL_TRACKS.map((t, idx) => {
-                  const isCurrent = currentTrackIndex === idx;
-                  const isSamePhrase =
-                    !isCurrent &&
-                    currentTrack &&
-                    currentTrack.phraseType !== 'other' &&
-                    currentTrack.phraseType === t.phraseType;
-                  const color = PHRASE_COLORS[t.phraseType];
-
-                  return (
-                    <button
-                      key={t.id}
-                      onClick={() => playTrack(idx)}
-                      title={`#${t.order} ${t.title} (${t.subPart})`}
-                      className={`h-full min-w-[20px] flex-1 rounded-md text-[10px] font-bold flex items-center justify-center transition-all relative group ${
-                        isCurrent
-                          ? 'bg-white text-slate-950 shadow-lg ring-2 ring-rose-500 scale-110 z-10'
-                          : isSamePhrase
-                          ? `${color.badgeBg} text-white ring-2 ring-white/60 animate-pulse`
-                          : `${color.badgeBg} text-white/90 opacity-60 hover:opacity-100 hover:scale-105`
-                      }`}
-                    >
-                      {t.phraseType !== 'other' ? t.phraseType : '・'}
-                      {/* ホバーツールチップ */}
-                      <span className="absolute -top-8 left-1/2 -translate-x-1/2 px-2 py-0.5 bg-slate-800 text-[10px] text-white rounded whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity border border-slate-700 shadow-lg z-20">
-                        #{t.order} {t.title}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* 各セクションブロックごとのカードグリッド */}
-            <div className="space-y-6">
-              {SONG_SECTIONS.map((section: SectionGroup) => (
-                <section
-                  key={section.id}
-                  className="rounded-2xl bg-slate-900/60 border border-slate-800/90 p-4 sm:p-5 shadow-xl backdrop-blur-sm relative overflow-hidden"
-                >
-                  {/* セクション上部見出し */}
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 mb-4 border-b border-slate-800">
-                    <div className="flex items-center gap-3">
-                      <span
-                        className={`text-xs font-extrabold px-2.5 py-0.5 rounded-md text-white ${
-                          section.majorPart === '前奏'
-                            ? 'bg-slate-700'
-                            : section.majorPart === '前半'
-                            ? 'bg-blue-600'
-                            : 'bg-rose-700'
-                        }`}
-                      >
-                        {section.majorPart}
-                      </span>
-                      <h3 className="text-base sm:text-lg font-bold text-white tracking-wide">
+              {/* 項の中のサブセクション行リスト */}
+              <div className="space-y-1 sm:space-y-1.5">
+                {group.sections.map((section: SectionGroup) => (
+                  <div
+                    key={section.id}
+                    className="rounded-xl bg-slate-950/45 border border-slate-800/40 px-2 sm:px-2.5 py-1 flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-2 hover:bg-slate-950/70 transition-colors"
+                  >
+                    {/* 左側: サブパート名（初番、中盤、後半、宮、結び 等） */}
+                    <div className="flex items-center gap-2 min-w-[50px] sm:min-w-[65px] shrink-0">
+                      <span className="text-xs font-bold text-slate-300">
                         {section.displayName}
-                      </h3>
-                      <span className="text-xs text-slate-400 hidden sm:inline">
-                        — {section.description}
                       </span>
                     </div>
 
-                    {section.repeatHint && (
-                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30 self-start sm:self-auto">
-                        <Sparkles className="w-3 h-3" />
-                        {section.repeatHint}
-                      </span>
-                    )}
-                  </div>
+                    {/* 右側: フレーズボックスの横並び（コンパクトな正方形タイル群） */}
+                    <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+                      {section.tracks.map(track => {
+                        const globalIndex = ALL_TRACKS.findIndex(t => t.id === track.id);
+                        const isCurrent = currentTrackIndex === globalIndex;
+                        const isSamePhrase =
+                          !isCurrent &&
+                          currentTrack &&
+                          currentTrack.phraseType !== 'other' &&
+                          currentTrack.phraseType === track.phraseType;
+                        const isHovered =
+                          hoveredPhraseType !== null &&
+                          hoveredPhraseType !== 'other' &&
+                          hoveredPhraseType === track.phraseType;
+                        const color = PHRASE_COLORS[track.phraseType];
+                        const isMultiChar = track.phraseLabel.length > 1;
 
-                  {/* セクション内フレーズカード */}
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-                    {section.tracks.map(track => {
-                      const globalIndex = ALL_TRACKS.findIndex(t => t.id === track.id);
-                      const isCurrent = currentTrackIndex === globalIndex;
-                      const isSamePhrase =
-                        !isCurrent &&
-                        currentTrack &&
-                        currentTrack.phraseType !== 'other' &&
-                        currentTrack.phraseType === track.phraseType;
-                      const isHovered =
-                        hoveredPhraseType !== null &&
-                        hoveredPhraseType !== 'other' &&
-                        hoveredPhraseType === track.phraseType;
-
-                      const color = PHRASE_COLORS[track.phraseType];
-
-                      return (
-                        <div
-                          key={track.id}
-                          onClick={() => playTrack(globalIndex)}
-                          onMouseEnter={() =>
-                            track.phraseType !== 'other' && setHoveredPhraseType(track.phraseType)
-                          }
-                          onMouseLeave={() => setHoveredPhraseType(null)}
-                          className={`rounded-2xl p-3.5 flex flex-col justify-between transition-all duration-300 cursor-pointer relative group ${
-                            isCurrent
-                              ? 'bg-slate-900 border-2 border-rose-500 shadow-2xl scale-[1.03] z-10'
-                              : isSamePhrase
-                              ? 'bg-slate-900/90 border-2 border-dashed border-white/80 shadow-xl shadow-rose-950/20'
-                              : isHovered
-                              ? 'bg-slate-800/90 border-slate-500 shadow-lg -translate-y-0.5'
-                              : 'bg-slate-950/60 hover:bg-slate-900/80 border border-slate-800/90 hover:border-slate-700'
-                          }`}
-                          style={{
-                            boxShadow: isCurrent
-                              ? `0 0 25px ${color.glow}`
-                              : isSamePhrase
-                              ? `0 0 15px ${color.glow}`
-                              : undefined,
-                          }}
-                        >
-                          {/* 再生中バッジ */}
-                          {isCurrent && (
-                            <span className="absolute -top-2.5 right-3 px-2 py-0.5 rounded-full text-[9px] font-extrabold bg-rose-600 text-white tracking-wider flex items-center gap-1 shadow-md">
-                              <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
-                              演奏中
-                            </span>
-                          )}
-
-                          {/* 同期ハイライトバッジ */}
-                          {isSamePhrase && (
-                            <span className="absolute -top-2.5 right-3 px-2 py-0.5 rounded-full text-[9px] font-bold bg-amber-500 text-slate-950 tracking-wider shadow-md">
-                              同調中
-                            </span>
-                          )}
-
-                          {/* 上部: 番号 & 秒数 */}
-                          <div className="flex items-center justify-between text-[11px] text-slate-400 mb-2 font-medium">
-                            <span>#{track.order}</span>
-                            {track.durationSec && (
-                              <span className="text-[10px] text-slate-400 font-mono">
-                                {track.durationSec}s
-                              </span>
-                            )}
-                          </div>
-
-                          {/* 中央: 家紋風 フレーズ大シンボル */}
-                          <div className="flex items-center justify-center my-2">
-                            <div
-                              className={`w-12 h-12 rounded-2xl ${color.badgeBg} text-white font-extrabold text-xl flex items-center justify-center shadow-lg border border-white/20 transition-transform group-hover:scale-105`}
-                            >
-                              {track.phraseLabel}
-                            </div>
-                          </div>
-
-                          {/* 下部: タイトル */}
-                          <div className="text-center mt-1">
-                            <p className="text-xs font-bold text-slate-200 truncate">
-                              {track.title}
-                            </p>
-                            <p className="text-[10px] text-slate-400 truncate mt-0.5">
-                              {color.name}
-                            </p>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </section>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* ============================================================== */}
-        {/* TAB 2: 暗記の秘訣（要約フロー） */}
-        {/* ============================================================== */}
-        {activeTab === 'structure' && (
-          <div className="space-y-6">
-            <div className="rounded-2xl bg-slate-900/70 border border-slate-800 p-6 shadow-xl">
-              <div className="flex items-center gap-2 mb-2">
-                <BookOpen className="w-5 h-5 text-rose-500" />
-                <h2 className="text-lg font-bold text-white">
-                  お祭り笛 楽曲暗記の核心ルール（どこを繰り返すのか？）
-                </h2>
-              </div>
-              <p className="text-sm text-slate-400 mb-6">
-                楽譜がない伝承曲は、各節の音自体よりも「曲全体の中でどこへ展開し、何を繰り返すか」の分岐点を身体に染み込ませることが最重要です。
-              </p>
-
-              {/* ルールカード 1 */}
-              <div className="p-5 rounded-2xl bg-gradient-to-r from-blue-950/40 to-slate-900 border border-blue-500/30 mb-5 relative overflow-hidden">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="px-2 py-0.5 rounded bg-blue-600 text-white text-xs font-bold">
-                    前半の鉄則
-                  </span>
-                  <h3 className="text-base font-bold text-white">
-                    ①〜⑥を吹いた後、中盤を挟んで「①〜⑤」が2連続！
-                  </h3>
-                </div>
-                <p className="text-xs text-blue-200/80 mb-4 leading-relaxed">
-                  曲の出だしは <b>①〜⑥</b>（6まで行く）です。その後、中盤（A〜D）を挟んだら、
-                  次は <b>①〜⑤</b>（6は吹かない！）を通常バージョンと「宮」バージョンで <b>2回連続</b> 演奏します。
-                </p>
-
-                {/* 進行図 */}
-                <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
-                  <div className="px-3 py-1.5 rounded-xl bg-blue-900/60 border border-blue-500/40 text-blue-200">
-                    前半-前半: ① ② ③ ④ ⑤ ⑥
-                  </div>
-                  <ArrowRight className="w-4 h-4 text-slate-500" />
-                  <div className="px-3 py-1.5 rounded-xl bg-amber-950/60 border border-amber-500/40 text-amber-200">
-                    前半-中盤: A B C D
-                  </div>
-                  <ArrowRight className="w-4 h-4 text-slate-500" />
-                  <div className="px-3 py-1.5 rounded-xl bg-blue-900/90 border border-blue-400 text-white ring-2 ring-blue-500/50">
-                    前半-後半: ① ② ③ ④ ⑤
-                  </div>
-                  <ArrowRight className="w-4 h-4 text-slate-500" />
-                  <div className="px-3 py-1.5 rounded-xl bg-indigo-900/90 border border-indigo-400 text-white ring-2 ring-indigo-500/50">
-                    前半-後半宮: ① ② ③ ④ ⑤
-                  </div>
-                </div>
-              </div>
-
-              {/* ルールカード 2 */}
-              <div className="p-5 rounded-2xl bg-gradient-to-r from-amber-950/40 to-slate-900 border border-amber-500/30 relative overflow-hidden">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="px-2 py-0.5 rounded bg-amber-600 text-white text-xs font-bold">
-                    後半の鉄則
-                  </span>
-                  <h3 className="text-base font-bold text-white">
-                    中盤の「A〜D」が再登場！そして最後に【B】をもう一度吹く！
-                  </h3>
-                </div>
-                <p className="text-xs text-amber-200/80 mb-4 leading-relaxed">
-                  後半では中盤で吹いたフレーズが戻ってきます。
-                  <b>A ➔ B ➔ C ➔ D ➔ B</b> という順で、<b>「B」を最後にもう一度反復する</b>のが一番のポイントです。
-                  その後の宮演奏では <b>C ➔ D ➔ B</b> で締めくくられます。
-                </p>
-
-                {/* 進行図 */}
-                <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
-                  <div className="px-3 py-1.5 rounded-xl bg-amber-950/60 border border-amber-500/40 text-amber-200">
-                    前半-中盤: A ➔ B ➔ C ➔ D
-                  </div>
-                  <span className="text-slate-500">➔【後半で変化】➔</span>
-                  <div className="px-3 py-1.5 rounded-xl bg-amber-900/90 border border-amber-400 text-white ring-2 ring-amber-500/50 font-bold">
-                    後半-前半: A ➔ B ➔ C ➔ D ➔ <span className="text-yellow-300 underline">B(反復!)</span>
-                  </div>
-                  <ArrowRight className="w-4 h-4 text-slate-500" />
-                  <div className="px-3 py-1.5 rounded-xl bg-orange-950/80 border border-orange-500/40 text-orange-200">
-                    後半宮: C ➔ D ➔ B
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ============================================================== */}
-        {/* TAB 3: 同フレーズ聴き比べ */}
-        {/* ============================================================== */}
-        {activeTab === 'compare' && (
-          <div className="space-y-6">
-            <div className="rounded-2xl bg-slate-900/70 border border-slate-800 p-6 shadow-xl">
-              <div className="flex items-center gap-2 mb-2">
-                <Sparkles className="w-5 h-5 text-rose-500" />
-                <h2 className="text-lg font-bold text-white">
-                  同じフレーズの各テイク・ニュアンス聴き比べ
-                </h2>
-              </div>
-              <p className="text-sm text-slate-400 mb-6">
-                フレーズ記号を選ぶと、通常・後半・宮バージョンなどの演奏テイクを並べて集中的に比較再生できます。
-              </p>
-
-              {/* フレーズ選択セレクタ */}
-              <div className="flex flex-wrap gap-2 mb-6">
-                {(['1', '2', '3', '4', '5', '6', 'A', 'B', 'C', 'D'] as PhraseType[]).map(type => {
-                  const isSelected = selectedPhraseForCompare === type;
-                  const color = PHRASE_COLORS[type];
-
-                  return (
-                    <button
-                      key={type}
-                      onClick={() => setSelectedPhraseForCompare(type)}
-                      className={`px-4 py-2 rounded-xl text-sm font-bold transition-all border flex items-center gap-2 ${
-                        isSelected
-                          ? `${color.badgeBg} text-white shadow-lg shadow-black/50 border-white/50 scale-105`
-                          : 'bg-slate-800/80 text-slate-300 border-slate-700 hover:bg-slate-700'
-                      }`}
-                    >
-                      <span>フレーズ {type}</span>
-                      <span className="text-xs opacity-75 font-normal">({color.name})</span>
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* 選択されたフレーズの全テイク一覧 */}
-              <div className="space-y-3">
-                {(PHRASE_GROUPS[selectedPhraseForCompare] || []).map((track: TrackItem) => {
-                  const globalIdx = ALL_TRACKS.findIndex(t => t.id === track.id);
-                  const isCurrent = currentTrackIndex === globalIdx;
-                  const color = PHRASE_COLORS[track.phraseType];
-
-                  return (
-                    <div
-                      key={track.id}
-                      className={`p-4 rounded-xl border transition-all flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 ${
-                        isCurrent
-                          ? 'bg-slate-900 border-rose-500 shadow-xl ring-1 ring-rose-500/50'
-                          : 'bg-slate-950/70 border-slate-800 hover:border-slate-700'
-                      }`}
-                    >
-                      <div className="flex items-center gap-3">
-                        <div
-                          className={`w-11 h-11 rounded-xl ${color.badgeBg} text-white font-bold flex items-center justify-center text-lg shadow-md shrink-0`}
-                        >
-                          {track.phraseLabel}
-                        </div>
-                        <div>
-                          <h4 className="text-sm font-bold text-white flex items-center gap-2">
-                            {track.majorPart} - {track.subPart} ({track.title})
+                        return (
+                          <button
+                            key={track.id}
+                            onClick={() => {
+                              unlockAudioContext();
+                              playTrack(globalIndex);
+                            }}
+                            onMouseEnter={() =>
+                              track.phraseType !== 'other' && setHoveredPhraseType(track.phraseType)
+                            }
+                            onMouseLeave={() => setHoveredPhraseType(null)}
+                            title={`${track.subPart} ${track.phraseLabel}`}
+                            className={`w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center font-black ${
+                              isMultiChar ? 'text-[11px] sm:text-xs tracking-tighter' : 'text-sm sm:text-base'
+                            } transition-all duration-150 relative select-none ${
+                              isCurrent
+                                ? 'bg-slate-950 text-white scale-110 shadow-2xl border-2 z-10'
+                                : isSamePhrase
+                                ? `${color.badgeBg} text-white ring-2 ring-white animate-pulse shadow-md`
+                                : isHovered
+                                ? `${color.badgeBg} text-white shadow-lg scale-105 brightness-110`
+                                : `${color.badgeBg} text-white/95 opacity-90 hover:opacity-100 hover:scale-105 border border-white/20 shadow-sm`
+                            }`}
+                            style={{
+                              borderColor: isCurrent ? color.main : undefined,
+                              boxShadow: isCurrent
+                                ? `0 0 18px ${color.glow}, inset 0 0 10px ${color.glow}`
+                                : isSamePhrase
+                                ? `0 0 10px ${color.glow}`
+                                : undefined,
+                            }}
+                          >
+                            {track.phraseLabel}
                             {isCurrent && (
-                              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-600 text-white">
-                                再生中
-                              </span>
+                              <>
+                                <span
+                                  className="absolute -top-1 -right-1 w-2 h-2 rounded-full animate-ping"
+                                  style={{ backgroundColor: color.main }}
+                                />
+                                <span
+                                  className="absolute -top-1 -right-1 w-2 h-2 rounded-full"
+                                  style={{ backgroundColor: color.main }}
+                                />
+                              </>
                             )}
-                          </h4>
-                          <p className="text-xs text-slate-400 mt-0.5 font-mono">
-                            通し #{track.order} • 長さ: {track.durationSec}秒 • 音源: {track.fileName}
-                          </p>
-                        </div>
-                      </div>
-
-                      <button
-                        onClick={() => {
-                          if (isCurrent && isPlaying) {
-                            togglePlayPause();
-                          } else {
-                            playTrack(globalIdx);
-                          }
-                        }}
-                        className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all self-end sm:self-auto ${
-                          isCurrent && isPlaying
-                            ? 'bg-rose-600 text-white shadow-lg shadow-rose-950'
-                            : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
-                        }`}
-                      >
-                        {isCurrent && isPlaying ? (
-                          <>
-                            <Pause className="w-3.5 h-3.5" />
-                            一時停止
-                          </>
-                        ) : (
-                          <>
-                            <Play className="w-3.5 h-3.5" />
-                            このテイクを再生
-                          </>
-                        )}
-                      </button>
+                          </button>
+                        );
+                      })}
                     </div>
-                  );
-                })}
+                  </div>
+                ))}
               </div>
             </div>
-          </div>
-        )}
+          ))}
+        </div>
       </main>
 
       {/* ============================================================== */}
@@ -763,7 +698,16 @@ export default function App() {
         <div className="rounded-2xl bg-slate-900/90 backdrop-blur-2xl border border-slate-700/80 p-3 sm:p-4 shadow-2xl shadow-black/80">
           {/* プログレスバー */}
           <div className="mb-2">
-            <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden relative cursor-pointer">
+            <div
+              className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden relative cursor-pointer"
+              onClick={e => {
+                if (!duration || currentTrackIndex === null) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                const targetTime = pos * duration;
+                playTrack(currentTrackIndex, targetTime);
+              }}
+            >
               <div
                 className="h-full bg-gradient-to-r from-rose-500 to-amber-500 rounded-full transition-all duration-150"
                 style={{
@@ -840,7 +784,7 @@ export default function App() {
             </div>
 
             {/* 右側: 再生モード & 速度 */}
-            <div className="flex items-center gap-2 justify-end flex-1">
+            <div className="flex items-center gap-1.5 sm:gap-2 justify-end flex-1">
               {/* モード切替 */}
               <button
                 onClick={() => {
