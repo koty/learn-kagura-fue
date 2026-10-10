@@ -150,7 +150,7 @@ export const SONG_SECTIONS: SectionGroup[] = [
     id: 'zenhan-zenhan',
     majorPart: '前半',
     subPart: '前半',
-    displayName: '初番',
+    displayName: '前半',
     description: '基本となる数字フレーズ ① 〜 ⑥',
     repeatHint: '①〜⑥',
     tracks: [

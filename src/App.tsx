@@ -593,7 +593,7 @@ export default function App() {
                 </div>
                 {group.majorPart === '前半' && (
                   <span className="text-[10px] text-slate-400 font-medium hidden sm:inline">
-                    初番 ➔ 中盤 ➔ 後半 ➔ 宮 ➔ 結び
+                    前半 ➔ 中盤 ➔ 後半 ➔ 宮 ➔ 結び
                   </span>
                 )}
                 {group.majorPart === '後半' && (
@@ -610,7 +610,7 @@ export default function App() {
                     key={section.id}
                     className="rounded-xl bg-slate-950/45 border border-slate-800/40 px-2 sm:px-2.5 py-1 flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-2 hover:bg-slate-950/70 transition-colors"
                   >
-                    {/* 左側: サブパート名（初番、中盤、後半、宮、結び 等） */}
+                    {/* 左側: サブパート名（前半、中盤、後半、宮、結び 等） */}
                     <div className="flex items-center gap-2 min-w-[50px] sm:min-w-[65px] shrink-0">
                       <span className="text-xs font-bold text-slate-300">
                         {section.displayName}
