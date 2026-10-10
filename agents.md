@@ -3,7 +3,7 @@
 ## 1. アプリ概要
 楽譜のないお祭りの神楽笛（全33節）を、反復構造・同一フレーズの視覚的グルーピングによって効率的に暗記・反復練習するためのWeb学習ナビゲーションアプリ。
 
-- **本番公開URL**: [https://fue.koty.dev](https://fue.koty.dev)
+- **本番公開URL**: [https://bamboo-flute.koty.dev](https://bamboo-flute.koty.dev)
 - **Pages URL**: [https://learn-kagura-fue.pages.dev](https://learn-kagura-fue.pages.dev)
 - **リポジトリ**: `koty/learn-kagura-fue` (GitHub)
 
