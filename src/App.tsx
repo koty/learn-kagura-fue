@@ -429,9 +429,6 @@ export default function App() {
                 <h1 className="text-base sm:text-lg font-bold tracking-tight text-white font-serif flex items-center gap-1.5">
                   神楽笛 旋律・リピート暗記帖
                 </h1>
-                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
-                  全33節
-                </span>
               </div>
               <p className="text-[11px] text-slate-400">楽譜のないお祭りの笛曲を、反復構造の可視化で覚える学習ナビ</p>
             </div>
@@ -512,7 +509,7 @@ export default function App() {
           <div className="flex items-center justify-between mb-1.5">
             <div className="flex items-center gap-1.5">
               <Flame className="w-3.5 h-3.5 text-amber-400" />
-              <span className="text-[11px] font-bold text-slate-300">通し進行バー（全33節）</span>
+              <span className="text-[11px] font-bold text-slate-300">通し進行バー</span>
             </div>
             <span className="text-[10px] text-slate-400">タップで再生</span>
           </div>
@@ -586,9 +583,6 @@ export default function App() {
                     className={`text-[10px] font-black px-2 py-0.5 rounded text-white shadow-sm ${group.badgeBg}`}
                   >
                     {group.displayName}
-                  </span>
-                  <span className="text-[11px] font-bold text-slate-400">
-                    全{group.totalTracks}節
                   </span>
                 </div>
                 {group.majorPart === '前半' && (
